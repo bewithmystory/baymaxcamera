@@ -150,7 +150,7 @@ bool initCamera() {
   if (psramFound()) {
     Serial.println("Camera memory: PSRAM");
     config.frame_size   = FRAMESIZE_QVGA; // 320x240 (fits HAND 60KB buffer)
-    config.jpeg_quality = 12;
+    config.jpeg_quality = 16;
     config.fb_count     = 2;
     config.fb_location  = CAMERA_FB_IN_PSRAM;
     config.grab_mode    = CAMERA_GRAB_LATEST;
@@ -274,6 +274,12 @@ void handlePhoto() {
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) {
     sendText(503, "Camera capture failed");
+    return;
+  }
+  if (fb->format != PIXFORMAT_JPEG || fb->len == 0 ||
+      fb->len > MAX_HAND_JPEG_BYTES) {
+    esp_camera_fb_return(fb);
+    sendText(413, "Photo exceeds HAND 60KB buffer");
     return;
   }
 
@@ -412,8 +418,9 @@ void handleMediaList() {
     return;
   }
 
-  // Collect matching basenames and keep the newest MAX_GALLERY_ITEMS entries
+  // Keep the newest matching filenames by their monotonically increasing IDs.
   String items[MAX_GALLERY_ITEMS];
+  unsigned long itemNumbers[MAX_GALLERY_ITEMS] = {};
   size_t count = 0;
 
   File entry = root.openNextFile();
@@ -424,15 +431,23 @@ void handleMediaList() {
       if (slash >= 0) fname = fname.substring(slash + 1);
 
       // Skip the actively recording file so the gallery only reads closed files
-      if (isValidMediaBasename(fname, wantVideo) && fname != activeRecordingName) {
-        if (count < MAX_GALLERY_ITEMS) {
-          items[count++] = fname;
-        } else {
-          // Shift window so newest files remain at the end
-          for (size_t i = 1; i < MAX_GALLERY_ITEMS; i++) {
-            items[i - 1] = items[i];
+      if (isValidMediaBasename(fname, wantVideo) && fname != activeRecordingName &&
+          (!wantVideo || entry.size() > 0)) {
+        const size_t numberOffset = wantVideo ? 5 : 6;
+        const unsigned long number = strtoul(fname.c_str() + numberOffset, nullptr, 10);
+        size_t insertAt = 0;
+        while (insertAt < count && itemNumbers[insertAt] > number) {
+          ++insertAt;
+        }
+        if (insertAt < MAX_GALLERY_ITEMS) {
+          const size_t newCount = count < MAX_GALLERY_ITEMS ? count + 1 : count;
+          for (size_t i = newCount - 1; i > insertAt; --i) {
+            items[i] = items[i - 1];
+            itemNumbers[i] = itemNumbers[i - 1];
           }
-          items[MAX_GALLERY_ITEMS - 1] = fname;
+          items[insertAt] = fname;
+          itemNumbers[insertAt] = number;
+          count = newCount;
         }
       }
     }
@@ -442,9 +457,9 @@ void handleMediaList() {
   root.close();
   setFlashLed(flashState);
 
-  // Output newest-first, one basename per line
+  // Output newest-first, one basename per line.
   String body = "";
-  for (int i = (int)count - 1; i >= 0; i--) {
+  for (size_t i = 0; i < count; ++i) {
     body += items[i] + "\n";
   }
   sendText(200, body);
@@ -478,9 +493,15 @@ void handleMediaPhoto() {
     return;
   }
 
-  if (file.size() == 0) {
+  const size_t fileSize = file.size();
+  if (fileSize == 0) {
     file.close();
     sendText(500, "Photo file is empty");
+    return;
+  }
+  if (fileSize > MAX_HAND_JPEG_BYTES) {
+    file.close();
+    sendText(413, "Photo exceeds HAND 60KB buffer");
     return;
   }
 

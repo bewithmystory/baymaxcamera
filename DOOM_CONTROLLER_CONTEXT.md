@@ -116,17 +116,17 @@ Endpoint constants are in `hand/include/config.h`:
 - `/record?state=1` starts recording; `state=0` stops it.
 - `/flash?state=1` turns flash on; `state=0` turns it off.
 - `/zoom?value=` is defined but is not currently sent by HAND.
-- The current camera firmware source only has live capture, save-photo,
-  record, flash, and status endpoints. It does not yet list or read saved files.
+-   The camera firmware also provides the SD gallery endpoints below. Keep
+  returned photo JPEGs and video frames at or below the HAND's 60,000-byte
+  buffer limit.
 
 The camera AP channel must remain channel 1. The HEAD auxiliary camera-power
 command controls camera power through the HEAD node; the camera's HTTP flash
 endpoint is controlled directly over Wi-Fi.
 
-### Planned SD gallery API (HAND client contract)
+### SD gallery API (HAND client contract)
 
-The HAND gallery client expects these endpoints. The camera firmware project
-must implement them for gallery support:
+The HAND gallery client uses these camera endpoints:
 
 - `GET /media/list?type=photo` or `type=video`: HTTP 200, plain text, one
   basename per line, newest/oldest ordering defined consistently by the camera.
@@ -138,6 +138,8 @@ must implement them for gallery support:
 - `GET /media/video/frame?name=<basename>&frame=<zero-based-index>`: HTTP 200
   with one JPEG frame from the concatenated-JPEG MJPEG recording, or HTTP 404
   when the requested frame is past the end.
+- `GET /media/video?name=<basename>`: optional full MJPEG recording download;
+  the HAND gallery currently plays recordings by requesting individual frames.
 - Return HTTP 404 for missing endpoints so the HAND can show
   `CAMERA GALLERY API NOT AVAILABLE`; use other error codes for SD/read errors.
 - Camera firmware must validate names against the expected photo/video
@@ -149,9 +151,9 @@ must implement them for gallery support:
   rate.
 
 The above endpoints are a planned integration contract, not currently
-implemented by the available camera source. The HAND client currently treats
-HTTP 404 as “gallery API unavailable”. Build the camera firmware against this
-document and verify the routes before expecting the gallery to show files.
+implemented by the camera firmware. The HAND client currently treats HTTP 404 from gallery-list/photo requests as
+“gallery API unavailable”; a 404 from a video-frame request means that the
+video is missing or the requested frame is past its end.
 
 ## Build and integration rules
 
