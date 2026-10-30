@@ -1,7 +1,7 @@
 /*
  * DOOM WORLD - ESP32-CAM Firmware (V4)
  * Board: AI-Thinker ESP32-CAM + OV2640
- * SoftAP: DOOM_CAM (Channel 1, IP: 192.168.4.1)
+ * SoftAP: DOOM_CAM (Channel 6, IP: 192.168.4.1)
  *
  * Supported HTTP Endpoints:
  *   GET /capture                            -> Live JPEG snapshot for TFT preview
@@ -18,6 +18,7 @@
 
 #include <Arduino.h>
 #include "esp_camera.h"
+#include "esp_wifi.h"
 #include <WiFi.h>
 #include <WebServer.h>
 #include "FS.h"
@@ -34,12 +35,31 @@ bool recording = false;
 bool flashState = false;
 int  zoomValue = 0;
 
+// Dynamic quality control
+int currentJpegQuality = JPEG_QUALITY_DEFAULT;
+int currentFrameSize = FRAMESIZE_QVGA;
+uint32_t lastQualityAdjust = 0;
+int lastMeasuredFps = 0;
+int8_t lastRssi = 0;
+
 File recordingFile;
 String activeRecordingName = "";
 uint32_t photoCounter = 0;
 uint32_t recordingCounter = 0;
 uint32_t recordedFrames = 0;
 uint32_t lastFrameWriteMs = 0;
+
+// Latency tracking
+uint32_t captureStartMs = 0;
+uint32_t encodeEndMs = 0;
+uint32_t httpSendStartMs = 0;
+uint32_t lastLatencyReport = 0;
+
+// Latest latency metrics (for /status endpoint)
+uint32_t lastTotalLatency = 0;
+uint32_t lastCaptureLatency = 0;
+uint32_t lastEncodeLatency = 0;
+uint32_t lastSendLatency = 0;
 
 // =====================================================
 // FLASH LED CONTROL (GPIO 4)
@@ -121,6 +141,76 @@ String nextRecordingPath() {
 }
 
 // =====================================================
+// DYNAMIC QUALITY ADJUSTMENT
+// =====================================================
+
+void adjustCameraQuality() {
+  if (!DYNAMIC_QUALITY_ENABLED) return;
+
+  uint32_t now = millis();
+  if (now - lastQualityAdjust < 2000) return; // Adjust every 2 seconds
+  lastQualityAdjust = now;
+
+  // Get current RSSI (for AP mode, we check connected stations)
+  wifi_sta_list_t staList;
+  if (esp_wifi_ap_get_sta_list(&staList) == ESP_OK && staList.num > 0) {
+    lastRssi = staList.sta[0].rssi; // RSSI of first connected station
+  }
+
+  // Get free heap
+  size_t freeHeap = ESP.getFreeHeap();
+
+  // Measure current FPS
+  int currentFps = lastMeasuredFps > 0 ? lastMeasuredFps : 15;
+
+  bool qualityChanged = false;
+
+  // Adjust based on RSSI (lower RSSI = worse signal = lower quality)
+  if (lastRssi < -75) { // Weak signal
+    if (currentJpegQuality < JPEG_QUALITY_MAX) {
+      currentJpegQuality += 2;
+      qualityChanged = true;
+    }
+  } else if (lastRssi > -55) { // Strong signal
+    if (currentJpegQuality > JPEG_QUALITY_MIN) {
+      currentJpegQuality -= 1;
+      qualityChanged = true;
+    }
+  }
+
+  // Adjust based on heap (low memory = lower quality)
+  if (freeHeap < 50000) { // Less than 50KB free
+    if (currentJpegQuality < JPEG_QUALITY_MAX) {
+      currentJpegQuality += 2;
+      qualityChanged = true;
+    }
+  }
+
+  // Adjust based on FPS (low FPS = lower quality)
+  if (currentFps < TARGET_FPS_MIN) {
+    if (currentJpegQuality < JPEG_QUALITY_MAX) {
+      currentJpegQuality += 1;
+      qualityChanged = true;
+    }
+  } else if (currentFps > TARGET_FPS_MAX && currentJpegQuality > JPEG_QUALITY_MIN) {
+    // High FPS, can improve quality
+    currentJpegQuality -= 1;
+    qualityChanged = true;
+  }
+
+  // Apply quality change
+  if (qualityChanged) {
+    currentJpegQuality = constrain(currentJpegQuality, JPEG_QUALITY_MIN, JPEG_QUALITY_MAX);
+    sensor_t *sensor = esp_camera_sensor_get();
+    if (sensor) {
+      sensor->set_quality(sensor, currentJpegQuality);
+      Serial.printf("Quality adjusted: Q=%d RSSI=%d Heap=%u FPS=%d\n",
+                    currentJpegQuality, lastRssi, freeHeap, currentFps);
+    }
+  }
+}
+
+// =====================================================
 // CAMERA INITIALIZATION
 // =====================================================
 
@@ -149,18 +239,20 @@ bool initCamera() {
 
   if (psramFound()) {
     Serial.println("Camera memory: PSRAM");
-    config.frame_size   = FRAMESIZE_QVGA; // 320x240 (fits HAND 60KB buffer)
-    config.jpeg_quality = 16;
+    config.frame_size   = FRAMESIZE_QVGA; // 320x240
+    config.jpeg_quality = currentJpegQuality;
     config.fb_count     = 2;
     config.fb_location  = CAMERA_FB_IN_PSRAM;
     config.grab_mode    = CAMERA_GRAB_LATEST;
+    currentFrameSize = FRAMESIZE_QVGA;
   } else {
     Serial.println("WARNING: PSRAM unavailable. Using DRAM QQVGA mode.");
     config.frame_size   = FRAMESIZE_QQVGA; // 160x120
-    config.jpeg_quality = 14;
+    config.jpeg_quality = currentJpegQuality;
     config.fb_count     = 1;
     config.fb_location  = CAMERA_FB_IN_DRAM;
     config.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
+    currentFrameSize = FRAMESIZE_QQVGA;
   }
 
   esp_err_t err = esp_camera_init(&config);
@@ -174,6 +266,7 @@ bool initCamera() {
     sensor->set_brightness(sensor, 0);
     sensor->set_contrast(sensor, 0);
     sensor->set_saturation(sensor, 0);
+    sensor->set_quality(sensor, currentJpegQuality);
   }
 
   return true;
@@ -186,6 +279,9 @@ bool initCamera() {
 void sendText(int statusCode, const String &message) {
   server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate");
   server.sendHeader("Access-Control-Allow-Origin", "*");
+  if (HTTP_KEEP_ALIVE_ENABLED) {
+    server.sendHeader("Connection", "keep-alive");
+  }
   server.send(statusCode, "text/plain; charset=utf-8", message);
 }
 
@@ -193,6 +289,9 @@ void sendJpegBuffer(const uint8_t *buf, size_t len) {
   WiFiClient client = server.client();
   server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate");
   server.sendHeader("Access-Control-Allow-Origin", "*");
+  if (HTTP_KEEP_ALIVE_ENABLED) {
+    server.sendHeader("Connection", "keep-alive");
+  }
   server.setContentLength(len);
   server.send(200, "image/jpeg", "");
   if (client.connected()) {
@@ -201,11 +300,30 @@ void sendJpegBuffer(const uint8_t *buf, size_t len) {
 }
 
 // =====================================================
-// RECORDING ENGINE
+// RECORDING ENGINE (MJPEG with proper boundary markers)
 // =====================================================
+
+static const char MJPEG_BOUNDARY[] = "--frameboundary\r\n";
+static const char MJPEG_HEADER_TEMPLATE[] = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
+
+void writeMjpegBoundary() {
+  if (recordingFile) {
+    recordingFile.write((const uint8_t *)MJPEG_BOUNDARY, strlen(MJPEG_BOUNDARY));
+  }
+}
+
+void writeMjpegHeader(size_t jpegLen) {
+  if (recordingFile) {
+    char header[64];
+    int headerLen = snprintf(header, sizeof(header), MJPEG_HEADER_TEMPLATE, jpegLen);
+    recordingFile.write((const uint8_t *)header, headerLen);
+  }
+}
 
 void stopRecording() {
   if (recordingFile) {
+    // Write final boundary marker to indicate end of stream
+    recordingFile.write((const uint8_t *)"--frameboundary--\r\n", 19);
     recordingFile.flush();
     recordingFile.close();
   }
@@ -227,6 +345,10 @@ void writeRecordingFrame() {
   if (!fb) return;
 
   if (fb->format == PIXFORMAT_JPEG && fb->len > 0 && fb->len <= MAX_HAND_JPEG_BYTES) {
+    // Write MJPEG frame with proper boundary and headers
+    writeMjpegBoundary();
+    writeMjpegHeader(fb->len);
+
     size_t written = recordingFile.write(fb->buf, fb->len);
     size_t expected = fb->len;
     esp_camera_fb_return(fb);
@@ -250,22 +372,63 @@ void writeRecordingFrame() {
 // =====================================================
 
 void handleCapture() {
+  if (LATENCY_TRACKING_ENABLED) {
+    captureStartMs = millis();
+  }
+
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) {
     sendText(503, "Camera capture failed");
     return;
   }
+
+  if (LATENCY_TRACKING_ENABLED) {
+    encodeEndMs = millis();
+  }
+
   if (fb->format != PIXFORMAT_JPEG || fb->len == 0 || fb->len > MAX_HAND_JPEG_BYTES) {
     esp_camera_fb_return(fb);
     sendText(500, "Invalid JPEG frame size");
     return;
   }
 
+  if (LATENCY_TRACKING_ENABLED) {
+    httpSendStartMs = millis();
+  }
+
   sendJpegBuffer(fb->buf, fb->len);
   esp_camera_fb_return(fb);
+
+  if (LATENCY_TRACKING_ENABLED) {
+    uint32_t httpSendEndMs = millis();
+    uint32_t totalLatency = httpSendEndMs - captureStartMs;
+    uint32_t captureLatency = encodeEndMs - captureStartMs;
+    uint32_t encodeLatency = httpSendStartMs - encodeEndMs;
+    uint32_t sendLatency = httpSendEndMs - httpSendStartMs;
+
+    // Store latest latency metrics for /status endpoint
+    lastTotalLatency = totalLatency;
+    lastCaptureLatency = captureLatency;
+    lastEncodeLatency = encodeLatency;
+    lastSendLatency = sendLatency;
+
+    // Report periodically
+    if (httpSendEndMs - lastLatencyReport > 5000) {
+      Serial.printf("Latency: Total=%lums Capture=%lums Encode=%lums Send=%lums Size=%uB\n",
+                    totalLatency, captureLatency, encodeLatency, sendLatency, fb->len);
+      lastLatencyReport = httpSendEndMs;
+    }
+
+    // Update FPS measurement
+    lastMeasuredFps = 1000 / max(1, (int)totalLatency);
+  }
 }
 
 void handlePhoto() {
+  if (LATENCY_TRACKING_ENABLED) {
+    captureStartMs = millis();
+  }
+
   if (!sdReady) {
     sendText(503, "SD card not ready");
     return;
@@ -276,11 +439,20 @@ void handlePhoto() {
     sendText(503, "Camera capture failed");
     return;
   }
+
+  if (LATENCY_TRACKING_ENABLED) {
+    encodeEndMs = millis();
+  }
+
   if (fb->format != PIXFORMAT_JPEG || fb->len == 0 ||
       fb->len > MAX_HAND_JPEG_BYTES) {
     esp_camera_fb_return(fb);
-    sendText(413, "Photo exceeds HAND 60KB buffer");
+    sendText(413, "Photo exceeds HAND 80KB buffer");
     return;
+  }
+
+  if (LATENCY_TRACKING_ENABLED) {
+    httpSendStartMs = millis();
   }
 
   String path = nextPhotoPath();
@@ -303,6 +475,17 @@ void handlePhoto() {
     SD_MMC.remove(path.c_str());
     sendText(500, "Photo write incomplete");
     return;
+  }
+
+  if (LATENCY_TRACKING_ENABLED) {
+    uint32_t httpSendEndMs = millis();
+    uint32_t totalLatency = httpSendEndMs - captureStartMs;
+    uint32_t captureLatency = encodeEndMs - captureStartMs;
+    uint32_t encodeLatency = httpSendStartMs - encodeEndMs;
+    uint32_t sendLatency = httpSendEndMs - httpSendStartMs;
+
+    Serial.printf("Photo Latency: Total=%lums Capture=%lums Encode=%lums SD_Write=%lums Size=%uB\n",
+                  totalLatency, captureLatency, encodeLatency, sendLatency, written);
   }
 
   sendText(200, "PHOTO_SAVED " + path + " " + String((unsigned long)written) + " bytes");
@@ -388,6 +571,24 @@ void handleStatus() {
   msg += String((unsigned long)recordedFrames);
   msg += "\nap_ip=";
   msg += WiFi.softAPIP().toString();
+  msg += "\nquality=";
+  msg += String(currentJpegQuality);
+  msg += "\nframesize=";
+  msg += String(currentFrameSize);
+  msg += "\nfps=";
+  msg += String(lastMeasuredFps);
+  msg += "\nrssi=";
+  msg += String(lastRssi);
+  msg += "\nheap=";
+  msg += String(ESP.getFreeHeap());
+  msg += "\nlatency_total=";
+  msg += String(lastTotalLatency);
+  msg += "\nlatency_capture=";
+  msg += String(lastCaptureLatency);
+  msg += "\nlatency_encode=";
+  msg += String(lastEncodeLatency);
+  msg += "\nlatency_send=";
+  msg += String(lastSendLatency);
   sendText(200, msg);
 }
 
@@ -501,7 +702,7 @@ void handleMediaPhoto() {
   }
   if (fileSize > MAX_HAND_JPEG_BYTES) {
     file.close();
-    sendText(413, "Photo exceeds HAND 60KB buffer");
+    sendText(413, "Photo exceeds HAND 80KB buffer");
     return;
   }
 
@@ -643,7 +844,7 @@ void handleMediaVideoFrame() {
   if (frameLength == 0 || frameLength > MAX_HAND_JPEG_BYTES) {
     file.close();
     setFlashLed(flashState);
-    sendText(500, "Video frame exceeds HAND 60KB buffer");
+    sendText(500, "Video frame exceeds HAND 80KB buffer");
     return;
   }
 
@@ -695,12 +896,12 @@ void setup() {
   }
   Serial.println("Camera sensor ready.");
 
-  // Mount microSD in 1-bit mode so GPIO 4 remains dedicated to the Flash LED
-  if (SD_MMC.begin("/sdcard", true)) {
+  // Mount microSD in 4-bit mode for faster writes (GPIO 4 shared with Flash LED)
+  if (SD_MMC.begin("/sdcard")) {
     if (SD_MMC.cardType() != CARD_NONE) {
       sdReady = true;
       syncCountersFromSD();
-      Serial.printf("SD_MMC (1-bit mode) ready. Next photo: %lu, Next video: %lu\n",
+      Serial.printf("SD_MMC (4-bit mode) ready. Next photo: %lu, Next video: %lu\n",
                     (unsigned long)(photoCounter + 1),
                     (unsigned long)(recordingCounter + 1));
     } else {
@@ -713,7 +914,7 @@ void setup() {
   // Re-assert Flash LED OFF after SD_MMC initialization
   setFlashLed(false);
 
-  // Start SoftAP locked to Channel 1 for ESP-NOW coexistence
+  // Start SoftAP on Channel 6 (avoids ESP-NOW channel 1 interference)
   WiFi.mode(WIFI_AP);
   WiFi.setSleep(false);
   bool apOK = WiFi.softAP(CAM_AP_SSID, CAM_AP_PASSWORD, CAM_AP_CHANNEL, false, CAM_MAX_CLIENTS);
@@ -748,5 +949,6 @@ void setup() {
 void loop() {
   server.handleClient();
   writeRecordingFrame();
+  adjustCameraQuality();
   delay(1);
 }
